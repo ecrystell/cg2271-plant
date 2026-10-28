@@ -1,0 +1,17 @@
+C:\Users\USER\Documents\MCUXpressoIDE_25.6.136\workspace\lab4\drivers/fsl_common_arm.h:998:24:DisableGlobalIRQ	16	static
+C:\Users\USER\Documents\MCUXpressoIDE_25.6.136\workspace\lab4\drivers/fsl_common_arm.h:1024:20:EnableGlobalIRQ	24	static
+../component/serial_manager/fsl_component_serial_manager.c:441:32:SerialManager_StartWriting	40	static
+../component/serial_manager/fsl_component_serial_manager.c:503:32:SerialManager_StartReading	40	static
+../component/serial_manager/fsl_component_serial_manager.c:1278:32:SerialManager_Write	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1295:32:SerialManager_Read	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1313:25:SerialManager_Init	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1530:25:SerialManager_Deinit	24	static
+../component/serial_manager/fsl_component_serial_manager.c:1609:25:SerialManager_OpenWriteHandle	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1646:25:SerialManager_CloseWriteHandle	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1680:25:SerialManager_OpenReadHandle	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1720:25:SerialManager_CloseReadHandle	32	static
+../component/serial_manager/fsl_component_serial_manager.c:1752:25:SerialManager_WriteBlocking	24	static
+../component/serial_manager/fsl_component_serial_manager.c:1761:25:SerialManager_ReadBlocking	24	static
+../component/serial_manager/fsl_component_serial_manager.c:2008:25:SerialManager_EnterLowpower	32	static
+../component/serial_manager/fsl_component_serial_manager.c:2064:25:SerialManager_ExitLowpower	32	static
+../component/serial_manager/fsl_component_serial_manager.c:2128:6:SerialManager_SetLowpowerCriticalCb	16	static

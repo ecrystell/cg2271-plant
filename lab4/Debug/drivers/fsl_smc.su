@@ -1,0 +1,16 @@
+../drivers/fsl_common_arm.h:998:24:DisableGlobalIRQ	16	static
+../drivers/fsl_common_arm.h:1024:20:EnableGlobalIRQ	24	static
+../drivers/fsl_smc.c:76:18:SMC_GetInvertedRegisterMask	16	static
+../drivers/fsl_smc.c:81:13:SMC_EnterStopRamFunc	16	static
+../drivers/fsl_smc.c:112:6:SMC_PreEnterStopModes	8	static
+../drivers/fsl_smc.c:124:6:SMC_PostExitStopModes	8	static
+../drivers/fsl_smc.c:135:6:SMC_PreEnterWaitModes	8	static
+../drivers/fsl_smc.c:147:6:SMC_PostExitWaitModes	8	static
+../drivers/fsl_smc.c:159:10:SMC_SetPowerModeRun	32	static
+../drivers/fsl_smc.c:200:10:SMC_SetPowerModeWait	16	static
+../drivers/fsl_smc.c:218:10:SMC_SetPowerModeStop	32	static
+../drivers/fsl_smc.c:262:10:SMC_SetPowerModeVlpr	32	static
+../drivers/fsl_smc.c:301:10:SMC_SetPowerModeVlpw	16	static
+../drivers/fsl_smc.c:319:10:SMC_SetPowerModeVlps	32	static
+../drivers/fsl_smc.c:355:10:SMC_SetPowerModeLls	32	static
+../drivers/fsl_smc.c:418:10:SMC_SetPowerModeVlls	32	static
