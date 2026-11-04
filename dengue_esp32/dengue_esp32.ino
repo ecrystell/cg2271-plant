@@ -1,6 +1,6 @@
 /*
 --------------------------------------------------------------------------------
--- Smart Anti-Dengue Plant Container — ESP32 Telegram gateway (MVP)
+-- Smart Anti-Dengue Plant Care System — ESP32 Telegram gateway (MVP)
 -- Structure adapted from the AS4 sample (c) Low Tjun Lym, NUS — educational use only.
 --------------------------------------------------------------------------------
 -- Role of this board
@@ -8,18 +8,22 @@
 --   - Receives status / events from the MCXC444 over UART
 --   - Over Wi-Fi + HTTPS, uses the Telegram Bot API (REST) to:
 --       send a daily time-left report
---       send instant alerts when the container is full, expired or emptied
+--       send instant alerts when the plate is full, expired or emptied
 --       receive commands: /status /report /open /close /auto /mute /reset
 --
--- Libraries (Library Manager): Arduino_JSON (by Arduino), DHT sensor library (by Adafruit)
+-- Libraries (Library Manager): Arduino_JSON (by Arduino), DHT sensor library (by Adafruit),
+--                              Adafruit Unified Sensor
+-- Secrets  : copy secrets.example.h to secrets.h and fill it in (secrets.h is git-ignored)
 -- Wiring : MCXC444 TX -> GPIO16 (RX2), MCXC444 RX <- GPIO17 (TX2), common GND
 --          DHT22 data -> GPIO4 (10k pull-up to 3V3)
 --
 -- UART protocol (9600 8N1, one message per line):
---   MCXC444 -> ESP32 : $STAT,<time_left_s>,<state>,<level>,<light>,<humidity>
+--   MCXC444 -> ESP32 : $STAT,<time_left_s>,<state>,<level>,<light>,<humidity>,<soil_dry>,<watering>
+--                      (only the first 5 fields are parsed)
 --                      $EVT,FULL | $EVT,CLEARED | $EVT,EXPIRED
 --   ESP32 -> MCXC444 : $HUM,<%RH>
 --                      $CMD,LID_OPEN | LID_CLOSE | LID_AUTO | MUTE | RESET
+--                      (LID_* names kept from an earlier design; they now control the sprinkler)
 --
 -- Tasks / RTOS objects
 --   tUartBridge : UART receive + DHT22 polling
@@ -36,12 +40,14 @@
 #include <Arduino_JSON.h>
 #include <DHT.h>
 
-const char* ssid = "";      // Fill in your own hotspot SSID here
-const char* password = "";  // Fill in your own hotspot password here
+#include "secrets.h"         // WIFI_SSID, WIFI_PASSWORD, BOT_TOKEN, CHAT_ID
+
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // Telegram bot: create with @BotFather, get your chat id from @userinfobot
-String botToken = "";       // e.g. "123456789:ABCdef..."
-String chatId   = "";       // e.g. "987654321"
+String botToken = BOT_TOKEN;
+String chatId   = CHAT_ID;
 
 // Pins
 #define DHT_PIN     4
@@ -56,7 +62,7 @@ unsigned long telegramDelay = 3000;    // check for new commands every 3 s
 
 // Latest status from the MCXC444 (protected by statusMutex)
 long timeLeft = -1;     // simulated seconds left, -1 = no data yet
-int  binState = 0;      // 0 = collecting, 1 = full, 2 = expired
+int  binState = 0;      // 0 = OK, 1 = full, 2 = expired
 int  waterLevel = 0;
 int  lightLevel = 0;
 int  humidity = -1;     // from DHT22
@@ -149,13 +155,13 @@ String formatTimeLeft(long s) {
 String stateName(int st) {
   if (st == 1) return "FULL";
   if (st == 2) return "EXPIRED";
-  return "collecting";
+  return "OK";
 }
 
 void sendStatus() {
   xSemaphoreTake(statusMutex, portMAX_DELAY);
   String text = "Time left: " + formatTimeLeft(timeLeft) +
-                "\nState: " + stateName(binState) +
+                "\nPlate: " + stateName(binState) +
                 "\nHumidity: " + (humidity >= 0 ? String(humidity) + "%" : String("n/a"));
   xSemaphoreGive(statusMutex);
   sendTelegram(text);
@@ -169,18 +175,18 @@ void sendDailyReport() {
   if (t < 0) return;                  // no data from MCXC444 yet
 
   String text = "Daily report: " + formatTimeLeft(t) + " left before mosquitoes can breed.";
-  if (st == 1) text += "\nContainer is FULL - please empty it.";
-  if (st == 2) text += "\nTime is up - empty the container now.";
+  if (st == 1) text += "\nPlate is FULL - please empty it.";
+  if (st == 2) text += "\nTime is up - empty the plate now.";
   sendTelegram(text);
 }
 
 void handleCommand(String cmd) {
   if (cmd == "/status")      sendStatus();
   else if (cmd == "/report") sendDailyReport();
-  else if (cmd == "/open")  { sendToMcx("$CMD,LID_OPEN");  sendTelegram("Lid opening."); }
-  else if (cmd == "/close") { sendToMcx("$CMD,LID_CLOSE"); sendTelegram("Lid closing."); }
-  else if (cmd == "/auto")  { sendToMcx("$CMD,LID_AUTO");  sendTelegram("Lid back on automatic."); }
-  else if (cmd == "/mute")  { sendToMcx("$CMD,MUTE");      sendTelegram("Buzzer muted until the container is emptied."); }
+  else if (cmd == "/open")  { sendToMcx("$CMD,LID_OPEN");  sendTelegram("Sprinkler on (stops by itself after 10 s)."); }
+  else if (cmd == "/close") { sendToMcx("$CMD,LID_CLOSE"); sendTelegram("Sprinkler held off. Send /auto to resume automatic watering."); }
+  else if (cmd == "/auto")  { sendToMcx("$CMD,LID_AUTO");  sendTelegram("Sprinkler back on automatic watering."); }
+  else if (cmd == "/mute")  { sendToMcx("$CMD,MUTE");      sendTelegram("Buzzer muted until the plate is emptied."); }
   else if (cmd == "/reset") { sendToMcx("$CMD,RESET");     sendTelegram("Timer reset to 6 days."); }
   else sendTelegram("Commands: /status /report /open /close /auto /mute /reset");
 }
@@ -292,13 +298,16 @@ void tTelegram(void *pvParameters) {
   unsigned long lastReport = 0;
   bool firstReportSent = false;
 
+  // Sent from here, not setup(): HTTPS needs this task's larger stack
+  sendTelegram("Plant care system online. Send /status any time.");
+
   for (;;) {
     // 1. Instant alerts from MCXC444 events
     int ev;
     while (xQueueReceive(evtQueue, &ev, 0) == pdTRUE) {
-      if (ev == EVT_FULL)    sendTelegram("ALERT: Container is FULL. Lid closed - please empty it.");
-      if (ev == EVT_EXPIRED) sendTelegram("ALERT: 6-day window reached. Empty the container now to stop mosquito breeding.");
-      if (ev == EVT_CLEARED) sendTelegram("Container emptied. Countdown reset to 6 days.");
+      if (ev == EVT_FULL)    sendTelegram("ALERT: Plate is FULL - please empty it.");
+      if (ev == EVT_EXPIRED) sendTelegram("ALERT: 6-day window reached. Empty the plate now to stop mosquito breeding.");
+      if (ev == EVT_CLEARED) sendTelegram("Plate emptied. Countdown reset to 6 days.");
     }
 
     // 2. Daily time-left report (first one as soon as the MCXC444 reports in)
@@ -313,6 +322,14 @@ void tTelegram(void *pvParameters) {
 
     // 3. Commands from the user
     checkTelegramCommands(offset);
+
+    // Debug: smallest free stack seen so far (bytes); keep this well above 0
+    static UBaseType_t minFree = UINT32_MAX;
+    UBaseType_t freeNow = uxTaskGetStackHighWaterMark(NULL);
+    if (freeNow < minFree) {
+      minFree = freeNow;
+      Serial.printf("[tg] stack free (min): %u bytes\n", (unsigned)minFree);
+    }
 
     vTaskDelay(pdMS_TO_TICKS(telegramDelay));
   }
@@ -340,10 +357,13 @@ void setup() {
   uartMutex   = xSemaphoreCreateMutex();
   evtQueue    = xQueueCreate(8, sizeof(int));
 
-  sendTelegram("Dengue container online. Send /status any time.");
-
-  xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096,  NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(tTelegram,   "tTelegram",   10240, NULL, 2, NULL, 0);
+  // Dual-core ESP32: UART on core 1, HTTPS + Wi-Fi on core 0.
+  // Single-core chips (ESP32-S2/C3): both on core 0; tUartBridge's higher
+  // priority still lets it preempt tTelegram whenever UART data arrives.
+  const BaseType_t uartCore = (portNUM_PROCESSORS > 1) ? 1 : 0;
+  xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096,  NULL, 3, NULL, uartCore);
+  // HTTPS + JSON parsing: measured ~3.6 KB peak use; 16 KB leaves ample headroom.
+  xTaskCreatePinnedToCore(tTelegram,   "tTelegram",   16384, NULL, 2, NULL, 0);
 }
 
 void loop() {
