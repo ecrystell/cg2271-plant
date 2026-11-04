@@ -13,7 +13,7 @@
 --
 -- Libraries (Library Manager): Arduino_JSON (by Arduino), DHT sensor library (by Adafruit),
 --                              Adafruit Unified Sensor
--- Secrets  : copy secrets.example.h to secrets.h and fill it in (secrets.h is git-ignored)
+-- Secrets  : fill in secrets.h (see the notes in that file; never commit real values)
 -- Wiring : MCXC444 TX -> GPIO16 (RX2), MCXC444 RX <- GPIO17 (TX2), common GND
 --          DHT22 data -> GPIO4 (10k pull-up to 3V3)
 --
@@ -213,7 +213,10 @@ void checkTelegramCommands(long &offset) {
 
     if (JSON.typeof(results[i]["message"]["text"]) != "string") continue;
     String fromChat = String((long long)(double)results[i]["message"]["chat"]["id"]);
-    if (fromChat != chatId) continue;                    // only the owner can control it
+    if (fromChat != chatId) {                            // only the owner can control it
+      Serial.println("[tg] ignored message from chat " + fromChat + " (CHAT_ID mismatch)");
+      continue;
+    }
 
     String cmd = (const char*)results[i]["message"]["text"];
     cmd.trim();
@@ -338,6 +341,8 @@ void tTelegram(void *pvParameters) {
 /* ------------------------------------------------------------------ */
 void setup() {
   Serial.begin(115200);
+  chatId.replace(" ", "");   // tolerate stray spaces pasted into CHAT_ID
+  botToken.trim();
   Serial1.begin(MCX_BAUD, SERIAL_8N1, MCX_RX_PIN, MCX_TX_PIN);
   dht.begin();
 
