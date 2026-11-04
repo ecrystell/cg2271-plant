@@ -1,4 +1,4 @@
-C:\Users\USER\Documents\MCUXpressoIDE_25.6.136\workspace\lab4\CMSIS/core_cm0plus.h:757:22:__NVIC_EnableIRQ	16	static
+C:\Users\USER\Desktop\nus\cg2271\cg2271-plant\lab4\CMSIS/core_cm0plus.h:757:22:__NVIC_EnableIRQ	16	static
 ../drivers/fsl_clock.h:437:20:CLOCK_EnableClock	24	static
 ../drivers/fsl_clock.h:448:20:CLOCK_DisableClock	24	static
 ../drivers/fsl_common_arm.h:754:24:EnableIRQ	24	static

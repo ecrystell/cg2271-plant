@@ -1,6 +1,6 @@
 ../freertos/freertos-kernel-upstream/stream_buffer.c:331:26:xStreamBufferGenericCreate	56	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:557:6:vStreamBufferDelete	24	static
-../freertos/freertos-kernel-upstream/stream_buffer.c:594:12:xStreamBufferReset	64	static
+../freertos/freertos-kernel-upstream/stream_buffer.c:594:12:xStreamBufferReset	56	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:655:12:xStreamBufferResetFromISR	64	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:720:12:xStreamBufferSetTriggerLevel	24	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:754:8:xStreamBufferSpacesAvailable	32	static
@@ -22,6 +22,3 @@
 ../freertos/freertos-kernel-upstream/stream_buffer.c:1587:13:prvInitialiseNewStreamBuffer	24	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:1635:13:uxStreamBufferGetStreamBufferNotificationIndex	24	static
 ../freertos/freertos-kernel-upstream/stream_buffer.c:1649:6:vStreamBufferSetStreamBufferNotificationIndex	24	static
-../freertos/freertos-kernel-upstream/stream_buffer.c:1673:17:uxStreamBufferGetStreamBufferNumber	16	static
-../freertos/freertos-kernel-upstream/stream_buffer.c:1687:10:vStreamBufferSetStreamBufferNumber	16	static
-../freertos/freertos-kernel-upstream/stream_buffer.c:1702:13:ucStreamBufferGetStreamBufferType	16	static

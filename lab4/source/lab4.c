@@ -176,6 +176,7 @@ static void pwm_init(TPM_Type *tpm, uint32_t frequency, uint32_t percent)
 }
 static bool uart_send_str(const char *text)
 {
+    const char *message = text;
     while (*text) {
         TickType_t start = xTaskGetTickCount();
         while (!(ESP_UART->STAT & LPUART_STAT_TDRE_MASK)) {
@@ -184,6 +185,10 @@ static bool uart_send_str(const char *text)
         }
         ESP_UART->DATA = (uint8_t)*text++;
     }
+    /* Echo complete outgoing messages to the board's debug-console terminal.
+     * Messages already contain '\n'; add CRLF here without a second blank line. */
+    size_t length = strcspn(message, "\r\n");
+    PRINTF("sent to esp32: %.*s\r\n", (int)length, message);
     return true;
 }
 static void hw_init(void)
