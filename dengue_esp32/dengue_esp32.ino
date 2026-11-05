@@ -28,6 +28,7 @@ String chatId = CHAT_ID;
 #define STATUS_TTL_MS 15000UL
 #define COMMAND_TTL_MS 10000UL
 #define COMMAND_RETRY_MS 2000UL
+#define SEND_RETRY_MS 30000UL /* Back-off after a failed sendMessage (blocked bot, rate limit, outage). */
 unsigned long humidityDelay = 30000UL;
 unsigned long reportDelay = 86400000UL; /* Daily interval; use 300000 only for a demo. */
 unsigned long telegramDelay = 3000UL;
@@ -81,14 +82,21 @@ String httpRequest(const String &url, const String *body) {
   http.end();
   return response;
 }
-bool sendTelegram(const String &text) {
+bool sendTelegram(const String &text) { /* Only called from tTelegram. */
+  static bool failed = false;
+  static uint32_t failedAt = 0;
   if (botToken.length() == 0 || chatId.length() == 0) return false;
+  /* After a failure, skip sends for SEND_RETRY_MS; callers keep the message pending. */
+  if (failed && millis() - failedAt < SEND_RETRY_MS) return false;
   JSONVar message;
   message["chat_id"] = chatId;
   message["text"] = text;
   String body = JSON.stringify(message);
   JSONVar response = JSON.parse(httpRequest("https://api.telegram.org/bot" + botToken + "/sendMessage", &body));
-  return JSON.typeof(response["ok"]) == "boolean" && (bool)response["ok"];
+  bool ok = JSON.typeof(response["ok"]) == "boolean" && (bool)response["ok"];
+  failed = !ok;
+  if (!ok) failedAt = millis();
+  return ok;
 }
 String formatTimeLeft(uint32_t seconds) {
   return String(seconds / 86400UL) + " d " + String((seconds % 86400UL) / 3600UL) + " h";
