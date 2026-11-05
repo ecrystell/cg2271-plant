@@ -1,615 +1,492 @@
-/*
- * dengue_mcxc444.c — Smart Anti-Dengue Plant Care System (MVP)
- * Target : FRDM-MCXC444, MCUXpresso SDK + FreeRTOS
+/* Smart plant care: direct-register MCXC444 peripherals + FreeRTOS.
+ * GPIO/PORT: LL-2/3; TPM: LL-4/5; ADC: LL-6; ISR/task/queue: LL-7/8.
+ * The supplied board clock/debug-console bootstrap is kept as in the labs.
+ * LPUART1 retains PTE0/PTE1 so the existing wiring need not change.
+ * The six-day reminder and environmental multipliers are demonstration rules,
+ * not a validated prediction of mosquito development or a safe storage time.
  *
- * Role of this board
- *   - Soil moisture sensor (interrupt): decides watering (with humidity)
- *   - Water level sensor (polled): water collecting in the plate under the pot —
- *     used only for the mosquito breeding countdown and "empty the plate" alerts
- *   - On-board light sensor (polled): long darkness speeds up mosquito breeding
- *   - Humidity arrives from the ESP32 over UART: decides watering length and
- *     speeds up the breeding countdown
- *   - Servo: turns the sprinkler valve on / off
- *   - On-board RGB LED: lights blue while watering
- *   - Buzzer: tells the user to empty the plate (full, or 6-day window used up)
- *
- * RTOS objects
- *   ISRs      : PORTA_IRQHandler (soil moisture DO edge), LPUART1_IRQHandler (UART RX)
- *   Tasks     : tIrrigation (prio 3), tCountdown (prio 2), tSensorPoll (prio 2),
- *               tActuator (prio 2), tComms (prio 1)
- *               -> three equal-priority tasks share the CPU by time-slicing
- *   Semaphore : soilSem    (binary, soil ISR -> tIrrigation)
- *   Mutex     : stateMutex (guards g_state)
- *   Queues    : sensorQ    (tSensorPoll -> tCountdown), rxQ (UART ISR -> tComms)
- *
- * Required FreeRTOSConfig.h settings
- *   #define configUSE_PREEMPTION                1
- *   #define configUSE_TIME_SLICING              1
- *   #define configUSE_MUTEXES                   1
- *   #define configUSE_TIMERS                    0   // not used
- *   #define configUSE_CO_ROUTINES               0   // not used
- *   #define configUSE_TRACE_FACILITY            0   // not used
- *   #define configGENERATE_RUN_TIME_STATS       0   // not used
- *   #define configUSE_IDLE_HOOK                 0
- *   #define configUSE_TICK_HOOK                 0
- *   #define configTICK_RATE_HZ                  1000
- *
- * UART protocol (9600 8N1, ASCII lines ending in '\n') — unchanged, so the ESP32
- * sketch works as-is:
- *   MCXC444 -> ESP32 : $STAT,<time_left_s>,<state>,<level>,<light>,<humidity>,<soil_dry>,<watering>
- *                      (ESP32 reads the first 5 fields; the last two are extra info)
- *                      $EVT,FULL | $EVT,CLEARED | $EVT,EXPIRED
- *   ESP32 -> MCXC444 : $HUM,<%RH integer>
- *                      $CMD,LID_OPEN   -> sprinkler ON  (manual, auto-stops after 10 s)
- *                      $CMD,LID_CLOSE  -> sprinkler OFF (manual hold)
- *                      $CMD,LID_AUTO   -> back to automatic watering
- *                      $CMD,MUTE       -> silence the buzzer until the plate is emptied
- *                      $CMD,RESET      -> reset the breeding countdown
- *
- * !! PIN NOTE: pins marked VERIFY are placeholders. Check them against the FRDM-MCXC444
- *    schematic / your lab pinout. Each is a #define, so a change is one line.
+ * UART, 9600 8N1, newline-terminated ASCII:
+ * TX $STAT,seconds,state,level,light,humidity,soil_dry,watering,mode,sensors_ok
+ *    (humidity=255 means unknown/stale)
+ * TX $EVT,id,FULL|CLEARED|EXPIRED|RESET ; RX $EACK,id
+ * RX $CMD,id,WATER_ON|WATER_OFF|AUTO|MUTE|UNMUTE|RESET ; TX $ACK,id,result
+ * RX $HUM,0..100 or $HUM,NA. Event retries are RAM-only, not reboot persistence.
  */
-
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-
 #include "board.h"
 #include "pin_mux.h"
 #include "clock_config.h"
 #include "fsl_debug_console.h"
-#include "fsl_clock.h"
-#include "fsl_port.h"
-#include "fsl_gpio.h"
-#include "fsl_adc16.h"
-#include "fsl_tpm.h"
-#include "fsl_lpuart.h"
-
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
+#include "plant_rules.h"
 
-/* ------------------------------------------------------------------ */
-/* Demo / tuning parameters                                            */
-/* ------------------------------------------------------------------ */
-#define BREED_WINDOW_S        (6UL * 24UL * 3600UL)   /* 6 days in seconds              */
-#define DEMO_TIME_SCALE       3600UL   /* 1 real second = 1 simulated hour (6 days ~ 2.4 min).
-                                          Set to 1 for real-time.                          */
-#define SAMPLE_PERIOD_MS      500U
+#define BREED_WINDOW_S       (6UL * 24UL * 3600UL)
+#ifndef DEMO_TIME_SCALE
+#define DEMO_TIME_SCALE      3600UL /* Set to 1 for real time; fractions are retained. */
+#endif
+#define SAMPLE_PERIOD_MS     500U
+#define LEVEL_EMPTY_ADC      400U
+#define LEVEL_WET_ADC        600U
+#define LIGHT_DARK_ADC       800U
+#define DARK_LIMIT_MS        10000U /* Demonstration setting; calibrate for your use. */
+#define HUMIDITY_HIGH_PCT    85U
+#define HUMIDITY_TTL_MS      120000U
+#define SENSOR_TTL_MS        2000U
+#define WATER_LONG_MS        5000U
+#define WATER_SHORT_MS       2500U
+#define WATER_COOLDOWN_MS    20000U
+#define MANUAL_WATER_MAX_MS  10000U
+#define SOIL_DRY_LEVEL       1U
+#define VALVE_OPEN_PCT       10U
+#define VALVE_CLOSED_PCT     5U
+#define STAT_PERIOD_MS       5000U
+#define EVENT_RETRY_MS       3000U
+#define PERIPH_CLK_HZ        48000000U
+#define ESP_UART_BAUD        9600U
+#define SOIL_PIN             12U /* PTA12, LM393 digital output, either edge. */
+#define SOIL_PORT            PORTA
+#define SOIL_GPIO            GPIOA
+#define LIGHT_ADC_CH         3U  /* PTE22, on-board light */
+#define WATER_ADC_CH         0U  /* PTE20, water sensor */
+#define SERVO_TPM            TPM1 /* PTB0, ALT3, channel 0 */
+#define BUZZ_TPM             TPM2 /* PTB2, ALT3, channel 0 */
+#define ESP_UART             LPUART1 /* PTE0 TX / PTE1 RX, ALT3 */
+#define UART_ERRORS (LPUART_STAT_OR_MASK | LPUART_STAT_NF_MASK | \
+                     LPUART_STAT_FE_MASK | LPUART_STAT_PF_MASK)
 
-/* Plate water level (12-bit ADC)                                                  calibrate */
-#define LEVEL_EMPTY_ADC       400U     /* below this = plate empty                          */
-#define LEVEL_WET_ADC         600U     /* above this = water present, countdown runs        */
-#define LEVEL_FULL_ADC        3000U    /* at/above this = plate full                        */
-#define LEVEL_HYST_ADC        150U
-
-/* Light (on-board sensor)                                                         calibrate */
-#define LIGHT_DARK_ADC        800U     /* below this = dark                                 */
-#define DARK_LIMIT_MS         10000U   /* dark longer than this -> countdown speeds up      */
-
-/* Humidity (from ESP32) */
-#define HUMIDITY_HIGH_PCT     85U      /* at/above: shorter watering, faster countdown      */
-#define DARK_PENALTY_PCT      50U      /* +50% countdown speed while dark too long          */
-#define HUMID_PENALTY_PCT     50U      /* +50% countdown speed while humid                  */
-
-/* Watering (demo values) */
-#define WATER_LONG_MS         5000U    /* soil dry, normal humidity                         */
-#define WATER_SHORT_MS        2500U    /* soil dry, high humidity -> less water needed      */
-#define WATER_COOLDOWN_MS     20000U   /* let water soak in before watering again           */
-#define MANUAL_WATER_MAX_MS   10000U   /* safety cap on a manual "on" command               */
-#define SOIL_DRY_LEVEL        1U       /* DO pin level meaning "dry" (most LM393 modules: 1) */
-
-/* Actuators */
-#define VALVE_OPEN_PCT        10U      /* servo 2.0 ms pulse @ 50 Hz -> sprinkler on        */
-#define VALVE_CLOSED_PCT      5U       /* servo 1.0 ms pulse @ 50 Hz -> sprinkler off       */
-#define BUZZER_FREQ_HZ        2000U
-#define STAT_PERIOD_MS        5000U
-
-/* ------------------------------------------------------------------ */
-/* Pin map                                                             */
-/* ------------------------------------------------------------------ */
-/* On-board RGB LED (active low) — per FRDM-MCXC444 board docs */
-#define LED_R_PORT  PORTE
-#define LED_R_GPIO  GPIOE
-#define LED_R_PIN   31U
-#define LED_G_PORT  PORTD
-#define LED_G_GPIO  GPIOD
-#define LED_G_PIN   5U
-#define LED_B_PORT  PORTE
-#define LED_B_GPIO  GPIOE
-#define LED_B_PIN   29U
-
-/* Soil moisture module digital output (LM393 comparator, threshold set by its pot)  VERIFY */
-#define SOIL_PORT   PORTA
-#define SOIL_GPIO   GPIOA
-#define SOIL_PIN    12U
-#define SOIL_IRQn   PORTA_IRQn
-
-/* ADC channels                                                       VERIFY */
-#define LIGHT_ADC_CH   3U    /* on-board light sensor, PTE22 / ADC0_SE3 */
-#define LIGHT_PORT     PORTE
-#define LIGHT_PIN      22U
-#define WATER_ADC_CH   0U    /* plate water level sensor, PTE20 / ADC0_SE0 */
-#define WATER_PORT     PORTE
-#define WATER_PIN      20U
-
-/* Servo (sprinkler valve): TPM1 CH0 on PTB0 (ALT3)                   VERIFY */
-#define SERVO_TPM      TPM1
-#define SERVO_CH       kTPM_Chnl_0
-#define SERVO_PORT     PORTB
-#define SERVO_PIN      0U
-#define SERVO_MUX      kPORT_MuxAlt3
-
-/* Buzzer: TPM2 CH0 on PTB2 (ALT3)                                    VERIFY */
-#define BUZZ_TPM       TPM2
-#define BUZZ_CH        kTPM_Chnl_0
-#define BUZZ_PORT      PORTB
-#define BUZZ_PIN       2U
-#define BUZZ_MUX       kPORT_MuxAlt3
-
-/* UART link to ESP32: LPUART1, TX PTE0 / RX PTE1 (ALT3)              VERIFY */
-#define ESP_UART       LPUART1
-#define ESP_UART_IRQn  LPUART1_IRQn
-#define ESP_UART_PORT  PORTE
-#define ESP_UART_TX    0U
-#define ESP_UART_RX    1U
-#define ESP_UART_MUX   kPORT_MuxAlt3
-#define ESP_UART_BAUD  9600U
-
-/* Peripheral clock: IRC48M selected for TPM and LPUART below */
-#define PERIPH_CLK_HZ  48000000U
-
-/* ------------------------------------------------------------------ */
-/* Types and shared state                                              */
-/* ------------------------------------------------------------------ */
-/* Plate state — numbering kept so the ESP32 shows the right text */
-typedef enum { ST_OK = 0, ST_FULL = 1, ST_EXPIRED = 2 } plate_state_t;
-
-typedef enum { WATER_AUTO = 0, WATER_FORCE_ON, WATER_FORCE_OFF } water_mode_t;
-
-#define EVT_FULL     (1U << 0)
-#define EVT_CLEARED  (1U << 1)
-#define EVT_EXPIRED  (1U << 2)
-
+typedef enum { ST_OK, ST_FULL, ST_EXPIRED } plate_state_t;
+enum { EVENT_FULL, EVENT_CLEARED, EVENT_EXPIRED, EVENT_RESET, EVENT_COUNT };
+static const char *const event_name[EVENT_COUNT] = { "FULL", "CLEARED", "EXPIRED", "RESET" };
 typedef struct {
-    uint16_t light;
-    uint16_t level;
+    uint16_t light, level;
+    TickType_t tick;
+    bool valid;
 } sensor_sample_t;
-
 typedef struct {
-    int32_t       time_left_s;   /* breeding countdown, simulated seconds */
+    int32_t time_left_s;
+    uint32_t fraction, dark_ms;
     plate_state_t state;
-    uint16_t      level;
-    uint16_t      light;
-    uint8_t       humidity;      /* %RH, from ESP32                        */
-    bool          soil_dry;
-    bool          watering;      /* sprinkler currently on                  */
-    water_mode_t  water_mode;    /* auto, or manual override from Telegram  */
-    bool          muted;
-    uint8_t       pending_evt;   /* EVT_* bits waiting to be sent           */
+    uint16_t level, light;
+    uint8_t humidity;
+    bool humidity_valid, sensors_valid, water_present, soil_dry, watering, muted;
+    TickType_t humidity_tick, sensor_tick;
+    water_mode_t water_mode;
+    uint8_t pending_evt;
+    uint32_t event_generation[EVENT_COUNT];
 } system_state_t;
+static system_state_t g_state;
+static SemaphoreHandle_t stateMutex, soilSem;
+static QueueHandle_t sensorQ, rxQ;
+static bool adc_ready;
+static volatile uint32_t rx_errors;
+/* Only tComms owns the command cache and in-flight event. */
+static bool event_active, event_acknowledged, command_seen;
+static uint32_t event_id, event_generation, command_id;
+static unsigned event_index;
+static char command_reply[64];
 
-static system_state_t    g_state;
-static SemaphoreHandle_t stateMutex;
-static SemaphoreHandle_t soilSem;
-static QueueHandle_t     sensorQ;
-static QueueHandle_t     rxQ;
+static bool sensors_fresh(const system_state_t *s, TickType_t now)
+{
+    return plant_fresh(s->sensors_valid, now, s->sensor_tick, pdMS_TO_TICKS(SENSOR_TTL_MS));
+}
+static bool humidity_fresh(const system_state_t *s, TickType_t now)
+{
+    return plant_fresh(s->humidity_valid, now, s->humidity_tick, pdMS_TO_TICKS(HUMIDITY_TTL_MS));
+}
+static void raise_event(unsigned index) /* stateMutex must be held */
+{
+    g_state.pending_evt |= (uint8_t)(1U << index);
+    g_state.event_generation[index]++;
+}
+static void reset_countdown_locked(void)
+{
+    g_state.time_left_s = (int32_t)BREED_WINDOW_S;
+    g_state.fraction = 0U;
+    g_state.dark_ms = 0U;
+    g_state.state = ST_OK;
+    g_state.water_present = false;
+    g_state.muted = false;
+}
 
-/* ------------------------------------------------------------------ */
-/* ISRs — kept short: clear flag, hand off to a task, yield if needed  */
-/* ------------------------------------------------------------------ */
+/* ISRs do only flag handling and FromISR hand-off. */
 void PORTA_IRQHandler(void)
 {
     BaseType_t woken = pdFALSE;
-    uint32_t flags = PORT_GetPinsInterruptFlags(SOIL_PORT);
-
-    if (flags & (1UL << SOIL_PIN)) {
-        xSemaphoreGiveFromISR(soilSem, &woken);   /* "soil changed wet <-> dry" */
+    if (SOIL_PORT->ISFR & (1UL << SOIL_PIN)) {
+        SOIL_PORT->ISFR = 1UL << SOIL_PIN; /* Write one to clear, not read/modify/write. */
+        xSemaphoreGiveFromISR(soilSem, &woken);
     }
-    PORT_ClearPinsInterruptFlags(SOIL_PORT, flags);
     portYIELD_FROM_ISR(woken);
 }
-
 void LPUART1_IRQHandler(void)
 {
     BaseType_t woken = pdFALSE;
-    uint32_t flags = LPUART_GetStatusFlags(ESP_UART);
-
-    if (flags & kLPUART_RxOverrunFlag) {
-        LPUART_ClearStatusFlags(ESP_UART, kLPUART_RxOverrunFlag);
-    }
-    if (flags & kLPUART_RxDataRegFullFlag) {
-        uint8_t c = LPUART_ReadByte(ESP_UART);
-        xQueueSendFromISR(rxQ, &c, &woken);       /* drop byte if queue full */
+    uint32_t status = ESP_UART->STAT;
+    if (status & (LPUART_STAT_RDRF_MASK | UART_ERRORS)) {
+        uint8_t byte = (uint8_t)ESP_UART->DATA;
+        if (status & UART_ERRORS) {
+            ESP_UART->STAT = (status & UART_ERRORS); /* W1C error flags. */
+            rx_errors++;
+        } else if (xQueueSendFromISR(rxQ, &byte, &woken) != pdTRUE) {
+            rx_errors++;
+        }
     }
     portYIELD_FROM_ISR(woken);
 }
 
-/* ------------------------------------------------------------------ */
-/* Hardware helpers                                                    */
-/* ------------------------------------------------------------------ */
-static uint16_t adc_read(uint32_t channel)
+static bool adc_read(uint32_t channel, uint16_t *result)
 {
-    adc16_channel_config_t ch = {
-        .channelNumber = channel,
-        .enableInterruptOnConversionCompleted = false,
-        .enableDifferentialConversion = false,
-    };
-    ADC16_SetChannelConfig(ADC0, 0U, &ch);
-    while (!(ADC16_GetChannelStatusFlags(ADC0, 0U) & kADC16_ChannelConversionDoneFlag)) { }
-    return (uint16_t)ADC16_GetChannelConversionValue(ADC0, 0U);
+    if (!adc_ready) return false;
+    ADC0->SC1[0] = ADC_SC1_ADCH(channel); /* Single-ended, software trigger, no ADC IRQ. */
+    for (uint32_t n = 0; n < 100000U; n++) {
+        if (ADC0->SC1[0] & ADC_SC1_COCO_MASK) {
+            *result = (uint16_t)ADC0->R[0];
+            return true;
+        }
+    }
+    return false; /* A faulty ADC cannot trap the poller in an endless busy wait. */
 }
-
-static void rgb_set(bool r, bool g, bool b)
-{
-    /* active low */
-    GPIO_PinWrite(LED_R_GPIO, LED_R_PIN, r ? 0U : 1U);
-    GPIO_PinWrite(LED_G_GPIO, LED_G_PIN, g ? 0U : 1U);
-    GPIO_PinWrite(LED_B_GPIO, LED_B_PIN, b ? 0U : 1U);
-}
-
 static bool soil_is_dry(void)
 {
-    return GPIO_PinRead(SOIL_GPIO, SOIL_PIN) == SOIL_DRY_LEVEL;
+    return ((SOIL_GPIO->PDIR >> SOIL_PIN) & 1U) == SOIL_DRY_LEVEL;
 }
-
-static void uart_send_str(const char *s)
+static void watering_led(bool on)
 {
-    LPUART_WriteBlocking(ESP_UART, (const uint8_t *)s, strlen(s));
+    GPIOE->PSOR = (1UL << 31) | (1UL << 29);
+    GPIOD->PSOR = 1UL << 5;
+    if (on) GPIOE->PCOR = 1UL << 29; /* Blue, active low. */
 }
-
+static void pwm_duty(TPM_Type *tpm, uint32_t percent)
+{
+    tpm->CONTROLS[0].CnV = ((tpm->MOD + 1U) * percent) / 100U;
+}
+static void pwm_init(TPM_Type *tpm, uint32_t frequency, uint32_t percent)
+{
+    tpm->SC = 0U;
+    tpm->CNT = 0U;
+    tpm->MOD = (PERIPH_CLK_HZ / 16U / frequency) - 1U;
+    tpm->CONTROLS[0].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
+    pwm_duty(tpm, percent);
+    tpm->SC = TPM_SC_PS(4U) | TPM_SC_CMOD(1U); /* Divide by 16, internal clock. */
+}
+static bool uart_send_str(const char *text)
+{
+    const char *message = text;
+    while (*text) {
+        TickType_t start = xTaskGetTickCount();
+        while (!(ESP_UART->STAT & LPUART_STAT_TDRE_MASK)) {
+            if ((TickType_t)(xTaskGetTickCount() - start) >= pdMS_TO_TICKS(50)) return false;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        ESP_UART->DATA = (uint8_t)*text++;
+    }
+    /* Echo complete outgoing messages to the board's debug-console terminal.
+     * Messages already contain '\n'; add CRLF here without a second blank line. */
+    size_t length = strcspn(message, "\r\n");
+    PRINTF("sent to esp32: %.*s\r\n", (int)length, message);
+    return true;
+}
 static void hw_init(void)
 {
-    CLOCK_EnableClock(kCLOCK_PortA);
-    CLOCK_EnableClock(kCLOCK_PortB);
-    CLOCK_EnableClock(kCLOCK_PortD);
-    CLOCK_EnableClock(kCLOCK_PortE);
+    NVIC_DisableIRQ(PORTA_IRQn);
+    NVIC_DisableIRQ(LPUART1_IRQn);
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK |
+                  SIM_SCGC5_PORTD_MASK | SIM_SCGC5_PORTE_MASK | SIM_SCGC5_LPUART1_MASK;
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK | SIM_SCGC6_TPM1_MASK | SIM_SCGC6_TPM2_MASK;
 
-    /* --- RGB LED --- */
-    gpio_pin_config_t out_hi = { kGPIO_DigitalOutput, 1U };
-    PORT_SetPinMux(LED_R_PORT, LED_R_PIN, kPORT_MuxAsGpio);
-    PORT_SetPinMux(LED_G_PORT, LED_G_PIN, kPORT_MuxAsGpio);
-    PORT_SetPinMux(LED_B_PORT, LED_B_PIN, kPORT_MuxAsGpio);
-    GPIO_PinInit(LED_R_GPIO, LED_R_PIN, &out_hi);
-    GPIO_PinInit(LED_G_GPIO, LED_G_PIN, &out_hi);
-    GPIO_PinInit(LED_B_GPIO, LED_B_PIN, &out_hi);
+    /* LL-2: select GPIO, establish the OFF value, then set output direction. */
+    PORTE->PCR[31] = PORT_PCR_MUX(1U);
+    PORTE->PCR[29] = PORT_PCR_MUX(1U);
+    PORTD->PCR[5] = PORT_PCR_MUX(1U);
+    GPIOE->PSOR = (1UL << 31) | (1UL << 29);
+    GPIOD->PSOR = 1UL << 5;
+    GPIOE->PDDR |= (1UL << 31) | (1UL << 29);
+    GPIOD->PDDR |= 1UL << 5;
+    SOIL_PORT->PCR[SOIL_PIN] = PORT_PCR_MUX(1U) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    SOIL_GPIO->PDDR &= ~(1UL << SOIL_PIN);
 
-    /* --- Soil moisture DO: GPIO input, interrupt on both edges (wet->dry and dry->wet) --- */
-    gpio_pin_config_t in = { kGPIO_DigitalInput, 0U };
-    PORT_SetPinMux(SOIL_PORT, SOIL_PIN, kPORT_MuxAsGpio);
-    GPIO_PinInit(SOIL_GPIO, SOIL_PIN, &in);
-    PORT_SetPinInterruptConfig(SOIL_PORT, SOIL_PIN, kPORT_InterruptEitherEdge);
-    NVIC_SetPriority(SOIL_IRQn, 2);
-    EnableIRQ(SOIL_IRQn);
+    /* LL-6: 12-bit, bus/2 clock divided by 4 (3 MHz), alternate board reference. */
+    PORTE->PCR[22] = 0U;
+    PORTE->PCR[20] = 0U;
+    ADC0->CFG1 = ADC_CFG1_ADICLK(1U) | ADC_CFG1_MODE(1U) |
+                 ADC_CFG1_ADIV(2U) | ADC_CFG1_ADLSMP_MASK;
+    ADC0->CFG2 = 0U;
+    ADC0->SC2 = ADC_SC2_REFSEL(1U); /* ValtH/ValtL, as required in LL-6 slide 23. */
+    ADC0->SC3 = ADC_SC3_CALF_MASK;
+    ADC0->SC3 = ADC_SC3_AVGE_MASK | ADC_SC3_AVGS(3U) | ADC_SC3_CAL_MASK;
+    uint32_t limit = 1000000U;
+    while ((ADC0->SC3 & ADC_SC3_CAL_MASK) && --limit) { }
+    adc_ready = limit != 0U && !(ADC0->SC3 & ADC_SC3_CALF_MASK);
+    if (adc_ready) {
+        uint32_t sum = ADC0->CLP0 + ADC0->CLP1 + ADC0->CLP2 + ADC0->CLP3 + ADC0->CLP4 + ADC0->CLPS;
+        ADC0->PG = (sum / 2U) | 0x8000U;
+        sum = ADC0->CLM0 + ADC0->CLM1 + ADC0->CLM2 + ADC0->CLM3 + ADC0->CLM4 + ADC0->CLMS;
+        ADC0->MG = (sum / 2U) | 0x8000U;
+    }
+    ADC0->SC3 = 0U;
 
-    /* --- ADC0 (light + water level) --- */
-    PORT_SetPinMux(LIGHT_PORT, LIGHT_PIN, kPORT_PinDisabledOrAnalog);
-    PORT_SetPinMux(WATER_PORT, WATER_PIN, kPORT_PinDisabledOrAnalog);
-    adc16_config_t adc_cfg;
-    ADC16_GetDefaultConfig(&adc_cfg);
-    adc_cfg.resolution = kADC16_ResolutionSE12Bit;
-    ADC16_Init(ADC0, &adc_cfg);
-    ADC16_EnableHardwareTrigger(ADC0, false);
-    (void)ADC16_DoAutoCalibration(ADC0);
+    /* LL-4/5: independent TPM periods, 50 Hz servo and 2 kHz passive buzzer. */
+    SIM->SOPT2 = (SIM->SOPT2 & ~(SIM_SOPT2_TPMSRC_MASK | SIM_SOPT2_LPUART1SRC_MASK)) |
+                 SIM_SOPT2_TPMSRC(1U) | SIM_SOPT2_LPUART1SRC(1U);
+    PORTB->PCR[0] = PORT_PCR_MUX(3U);
+    PORTB->PCR[2] = PORT_PCR_MUX(3U);
+    pwm_init(SERVO_TPM, 50U, VALVE_CLOSED_PCT);
+    pwm_init(BUZZ_TPM, 2000U, 0U);
 
-    /* --- TPM: servo (50 Hz) and buzzer (2 kHz) --- */
-    CLOCK_SetTpmClock(1U);   /* TPM clock source = IRC48M */
-    PORT_SetPinMux(SERVO_PORT, SERVO_PIN, SERVO_MUX);
-    PORT_SetPinMux(BUZZ_PORT, BUZZ_PIN, BUZZ_MUX);
-
-    tpm_config_t tpm_cfg;
-    TPM_GetDefaultConfig(&tpm_cfg);
-    tpm_cfg.prescale = kTPM_Prescale_Divide_16;   /* 48 MHz / 16 = 3 MHz */
-
-    tpm_chnl_pwm_signal_param_t servo_ch = {
-        .chnlNumber = SERVO_CH, .level = kTPM_HighTrue, .dutyCyclePercent = VALVE_CLOSED_PCT };
-    TPM_Init(SERVO_TPM, &tpm_cfg);
-    TPM_SetupPwm(SERVO_TPM, &servo_ch, 1U, kTPM_EdgeAlignedPwm, 50U, PERIPH_CLK_HZ);
-    TPM_StartTimer(SERVO_TPM, kTPM_SystemClock);
-
-    tpm_chnl_pwm_signal_param_t buzz_ch = {
-        .chnlNumber = BUZZ_CH, .level = kTPM_HighTrue, .dutyCyclePercent = 0U };
-    TPM_Init(BUZZ_TPM, &tpm_cfg);
-    TPM_SetupPwm(BUZZ_TPM, &buzz_ch, 1U, kTPM_EdgeAlignedPwm, BUZZER_FREQ_HZ, PERIPH_CLK_HZ);
-    TPM_StartTimer(BUZZ_TPM, kTPM_SystemClock);
-
-    /* --- LPUART1 to ESP32, RX interrupt --- */
-    CLOCK_SetLpuart1Clock(1U);   /* LPUART1 clock source = IRC48M */
-    PORT_SetPinMux(ESP_UART_PORT, ESP_UART_TX, ESP_UART_MUX);
-    PORT_SetPinMux(ESP_UART_PORT, ESP_UART_RX, ESP_UART_MUX);
-    lpuart_config_t u_cfg;
-    LPUART_GetDefaultConfig(&u_cfg);
-    u_cfg.baudRate_Bps = ESP_UART_BAUD;
-    u_cfg.enableTx = true;
-    u_cfg.enableRx = true;
-    LPUART_Init(ESP_UART, &u_cfg, PERIPH_CLK_HZ);
-    LPUART_EnableInterrupts(ESP_UART, kLPUART_RxDataRegFullInterruptEnable);
-    NVIC_SetPriority(ESP_UART_IRQn, 2);
-    EnableIRQ(ESP_UART_IRQn);
+    /* LL-8 register sequence, using LPUART1 instead of changing the wired UART. */
+    ESP_UART->CTRL = 0U; /* Disable TX/RX, parity off, eight data bits. */
+    PORTE->PCR[0] = PORT_PCR_MUX(3U);
+    PORTE->PCR[1] = PORT_PCR_MUX(3U);
+    SIM->SOPT5 &= ~(SIM_SOPT5_LPUART1TXSRC_MASK | SIM_SOPT5_LPUART1RXSRC_MASK);
+    uint32_t sbr = (PERIPH_CLK_HZ + ESP_UART_BAUD * 8U) / (ESP_UART_BAUD * 16U);
+    ESP_UART->BAUD = LPUART_BAUD_OSR(15U) | LPUART_BAUD_SBR(sbr);
+    ESP_UART->STAT = UART_ERRORS;
+    ESP_UART->CTRL = LPUART_CTRL_TE_MASK | LPUART_CTRL_RE_MASK;
+}
+static void enable_sensor_irqs(void)
+{
+    /* CMSIS takes unshifted 0..3 priorities on this M0+, not raw IPR byte values. */
+    NVIC_SetPriority(PORTA_IRQn, 2U);
+    NVIC_SetPriority(LPUART1_IRQn, 2U);
+    SOIL_PORT->ISFR = 1UL << SOIL_PIN;
+    SOIL_PORT->PCR[SOIL_PIN] |= PORT_PCR_IRQC(11U); /* Either edge. */
+    NVIC_ClearPendingIRQ(PORTA_IRQn);
+    NVIC_ClearPendingIRQ(LPUART1_IRQn);
+    ESP_UART->CTRL |= LPUART_CTRL_RIE_MASK;
+    NVIC_EnableIRQ(PORTA_IRQn);
+    NVIC_EnableIRQ(LPUART1_IRQn);
 }
 
-/* ------------------------------------------------------------------ */
-/* Task 1: tSensorPoll — fixed-rate polling of light + plate water level */
-/* ------------------------------------------------------------------ */
 static void tSensorPoll(void *arg)
 {
     (void)arg;
     TickType_t last = xTaskGetTickCount();
-    sensor_sample_t s;
-
     for (;;) {
-        s.light = adc_read(LIGHT_ADC_CH);
-        s.level = adc_read(WATER_ADC_CH);
-        xQueueSend(sensorQ, &s, 0);               /* never block the poller */
+        sensor_sample_t sample = {0};
+        sample.valid = adc_read(LIGHT_ADC_CH, &sample.light) && adc_read(WATER_ADC_CH, &sample.level);
+        sample.tick = xTaskGetTickCount();
+        xQueueSend(sensorQ, &sample, 0);
         vTaskDelayUntil(&last, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Task 2: tCountdown — breeding countdown for water in the plate       */
-/* ------------------------------------------------------------------ */
-static void reset_countdown_locked(void)
-{
-    g_state.time_left_s = (int32_t)BREED_WINDOW_S;
-    g_state.state       = ST_OK;
-    g_state.muted       = false;
-}
-
 static void tCountdown(void *arg)
 {
     (void)arg;
-    sensor_sample_t s;
-    uint32_t dark_ms = 0;
-    bool water_present = false;
-
+    sensor_sample_t sample;
+    TickType_t previous = xTaskGetTickCount();
     for (;;) {
-        if (xQueueReceive(sensorQ, &s, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        dark_ms = (s.light < LIGHT_DARK_ADC) ? dark_ms + SAMPLE_PERIOD_MS : 0U;
-
+        if (xQueueReceive(sensorQ, &sample, portMAX_DELAY) != pdTRUE) continue;
+        uint32_t elapsed = (TickType_t)(sample.tick - previous);
+        previous = sample.tick;
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        g_state.level = s.level;
-        g_state.light = s.light;
-
-        /* 1. Water appears / plate emptied (hysteresis between EMPTY and WET) */
-        if (!water_present && s.level >= LEVEL_WET_ADC) {
-            water_present = true;                 /* countdown starts running */
-        } else if (water_present && s.level < LEVEL_EMPTY_ADC) {
-            water_present = false;
-            reset_countdown_locked();             /* emptied -> fresh 6 days */
-            g_state.pending_evt |= EVT_CLEARED;
-            PRINTF("[cnt] plate emptied, timer reset\r\n");
-        }
-
-        /* 2. Countdown only while water is standing in the plate */
-        if (water_present && g_state.time_left_s > 0) {
-            uint32_t rate_pct = 100U;
-            if (dark_ms >= DARK_LIMIT_MS)              rate_pct += DARK_PENALTY_PCT;
-            if (g_state.humidity >= HUMIDITY_HIGH_PCT) rate_pct += HUMID_PENALTY_PCT;
-
-            uint32_t elapsed_sim_s = (SAMPLE_PERIOD_MS * DEMO_TIME_SCALE) / 1000U;
-            g_state.time_left_s -= (int32_t)((elapsed_sim_s * rate_pct) / 100U);
-            if (g_state.time_left_s < 0) g_state.time_left_s = 0;
-        }
-
-        /* 3. Plate state: FULL has priority, then EXPIRED */
-        plate_state_t prev = g_state.state;
-        if (s.level >= LEVEL_FULL_ADC ||
-            (prev == ST_FULL && s.level >= (LEVEL_FULL_ADC - LEVEL_HYST_ADC))) {
-            g_state.state = ST_FULL;
-        } else if (water_present && g_state.time_left_s == 0) {
-            g_state.state = ST_EXPIRED;
-        } else {
-            g_state.state = ST_OK;
-        }
-        if (g_state.state != prev) {
-            if (g_state.state == ST_FULL)    g_state.pending_evt |= EVT_FULL;
-            if (g_state.state == ST_EXPIRED) g_state.pending_evt |= EVT_EXPIRED;
+        g_state.sensors_valid = sample.valid;
+        g_state.sensor_tick = sample.tick;
+        if (sample.valid) {
+            g_state.level = sample.level;
+            g_state.light = sample.light;
+            uint32_t elapsed_ms = (uint32_t)((uint64_t)elapsed * 1000U / configTICK_RATE_HZ);
+            if (sample.light < LIGHT_DARK_ADC) {
+                uint32_t room = UINT32_MAX - g_state.dark_ms;
+                g_state.dark_ms += elapsed_ms < room ? elapsed_ms : room;
+            } else g_state.dark_ms = 0U;
+            bool was_present = g_state.water_present;
+            if (!was_present && sample.level >= LEVEL_WET_ADC) g_state.water_present = true;
+            else if (was_present && sample.level < LEVEL_EMPTY_ADC) {
+                reset_countdown_locked();
+                raise_event(EVENT_CLEARED);
+            }
+            if (was_present && g_state.water_present && g_state.time_left_s > 0) {
+                uint32_t rate = 100U;
+                if (g_state.dark_ms >= DARK_LIMIT_MS) rate += 50U;
+                if (humidity_fresh(&g_state, sample.tick) && g_state.humidity >= HUMIDITY_HIGH_PCT) rate += 50U;
+                plant_countdown(&g_state.time_left_s, &g_state.fraction, elapsed,
+                                configTICK_RATE_HZ, DEMO_TIME_SCALE, rate);
+            }
+            plate_state_t old = g_state.state;
+            if (plant_full(old == ST_FULL, sample.level)) g_state.state = ST_FULL;
+            else if (g_state.water_present && g_state.time_left_s == 0) g_state.state = ST_EXPIRED;
+            else g_state.state = ST_OK;
+            if (g_state.state != old) {
+                if (g_state.state == ST_FULL) { raise_event(EVENT_FULL); g_state.muted = false; }
+                if (g_state.state == ST_EXPIRED) { raise_event(EVENT_EXPIRED); g_state.muted = false; }
+            }
         }
         xSemaphoreGive(stateMutex);
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Task 3: tIrrigation — decides when the sprinkler runs                */
-/*   Woken by soilSem (soil changed) or every 250 ms to time a burst.   */
-/* ------------------------------------------------------------------ */
 static void tIrrigation(void *arg)
 {
     (void)arg;
-    bool watering = false;
-    TickType_t water_end = 0;
-    TickType_t cooldown_end = 0;
-
+    plant_irrigation_t irrigation = {0};
+    const plant_water_times_t time = {
+        pdMS_TO_TICKS(WATER_LONG_MS), pdMS_TO_TICKS(WATER_SHORT_MS),
+        pdMS_TO_TICKS(WATER_COOLDOWN_MS), pdMS_TO_TICKS(MANUAL_WATER_MAX_MS)
+    };
+    enable_sensor_irqs(); /* Queues exist and the scheduler is running. */
     for (;;) {
-        bool soil_changed = (xSemaphoreTake(soilSem, pdMS_TO_TICKS(250)) == pdTRUE);
+        xSemaphoreTake(soilSem, pdMS_TO_TICKS(250));
         bool dry = soil_is_dry();
         TickType_t now = xTaskGetTickCount();
-
+        /* Decision and state update are one short mutex-protected operation. */
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        water_mode_t mode = g_state.water_mode;
-        uint8_t humidity  = g_state.humidity;
-        xSemaphoreGive(stateMutex);
-
-        if (soil_changed) {
-            PRINTF("[irr] soil now %s\r\n", dry ? "DRY" : "wet");
-        }
-
-        if (mode == WATER_FORCE_ON) {
-            if (!watering) {                      /* manual on, capped for safety */
-                watering = true;
-                water_end = now + pdMS_TO_TICKS(MANUAL_WATER_MAX_MS);
-            } else if ((int32_t)(now - water_end) >= 0) {
-                watering = false;
-                mode = WATER_AUTO;                /* manual burst done -> back to auto */
-                cooldown_end = now + pdMS_TO_TICKS(WATER_COOLDOWN_MS);
-            }
-        } else if (mode == WATER_FORCE_OFF) {
-            watering = false;
-        } else if (watering) {
-            /* stop when the soil is wet again or the burst is over */
-            if (!dry || (int32_t)(now - water_end) >= 0) {
-                watering = false;
-                cooldown_end = now + pdMS_TO_TICKS(WATER_COOLDOWN_MS);
-            }
-        } else if (dry && (int32_t)(now - cooldown_end) >= 0) {
-            /* humid air -> plant loses less water -> shorter burst */
-            uint32_t burst = (humidity >= HUMIDITY_HIGH_PCT) ? WATER_SHORT_MS : WATER_LONG_MS;
-            watering = true;
-            water_end = now + pdMS_TO_TICKS(burst);
-            PRINTF("[irr] watering %lu ms (humidity %u%%)\r\n", (unsigned long)burst, humidity);
-        }
-
-        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        bool allowed = plant_can_water(sensors_fresh(&g_state, now), g_state.state == ST_FULL);
+        /* Unknown humidity uses the shorter bounded burst. */
+        bool short_burst = !humidity_fresh(&g_state, now) || g_state.humidity >= HUMIDITY_HIGH_PCT;
+        plant_irrigation_step(&irrigation, &g_state.water_mode, allowed, dry, short_burst, now, &time);
         g_state.soil_dry = dry;
-        g_state.watering = watering;
-        if (g_state.water_mode == WATER_FORCE_ON && mode == WATER_AUTO) {
-            g_state.water_mode = WATER_AUTO;
-        }
+        g_state.watering = irrigation.watering;
         xSemaphoreGive(stateMutex);
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Task 4: tActuator — servo valve, RGB LED, buzzer                     */
-/* ------------------------------------------------------------------ */
 static void tActuator(void *arg)
 {
     (void)arg;
-    system_state_t snap;
-    uint8_t beep = 0;
-    uint8_t last_servo = 0xFF;
-
+    uint8_t beep = 0, previous_duty = 255;
     for (;;) {
-        /* short critical section: copy and release */
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        snap = g_state;
+        system_state_t s = g_state;
         xSemaphoreGive(stateMutex);
-
-        /* Servo: sprinkler valve follows the watering decision */
-        uint8_t servo_pct = snap.watering ? VALVE_OPEN_PCT : VALVE_CLOSED_PCT;
-        if (servo_pct != last_servo) {
-            TPM_UpdatePwmDutycycle(SERVO_TPM, SERVO_CH, kTPM_EdgeAlignedPwm, servo_pct);
-            last_servo = servo_pct;
-        }
-
-        /* LED: blue while watering, off otherwise */
-        rgb_set(false, false, snap.watering);
-
-        /* Buzzer: chirp (300 ms on / 300 ms off) to ask the user to empty the plate */
-        bool alarm = (snap.state == ST_FULL || snap.state == ST_EXPIRED) && !snap.muted;
+        bool on = s.watering && plant_can_water(sensors_fresh(&s, xTaskGetTickCount()), s.state == ST_FULL);
+        uint8_t duty = on ? VALVE_OPEN_PCT : VALVE_CLOSED_PCT;
+        if (duty != previous_duty) { pwm_duty(SERVO_TPM, duty); previous_duty = duty; }
+        watering_led(on);
         beep = (uint8_t)((beep + 1U) % 6U);
-        TPM_UpdatePwmDutycycle(BUZZ_TPM, BUZZ_CH, kTPM_EdgeAlignedPwm,
-                               (alarm && beep < 3U) ? 50U : 0U);
-
+        bool alarm = (s.state == ST_FULL || s.state == ST_EXPIRED) && !s.muted;
+        pwm_duty(BUZZ_TPM, alarm && beep < 3U ? 50U : 0U);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Task 5: tComms — parse ESP32 frames, send status + events            */
-/* ------------------------------------------------------------------ */
-static void handle_line(const char *line)
+static void handle_line(char *line)
 {
-    xSemaphoreTake(stateMutex, portMAX_DELAY);
-    if (strncmp(line, "$HUM,", 5) == 0) {
-        int h = atoi(line + 5);
-        if (h >= 0 && h <= 100) g_state.humidity = (uint8_t)h;
-    } else if (strcmp(line, "$CMD,LID_OPEN") == 0) {        /* Telegram /open  */
-        g_state.water_mode = WATER_FORCE_ON;
-    } else if (strcmp(line, "$CMD,LID_CLOSE") == 0) {       /* Telegram /close */
-        g_state.water_mode = WATER_FORCE_OFF;
-    } else if (strcmp(line, "$CMD,LID_AUTO") == 0) {        /* Telegram /auto  */
-        g_state.water_mode = WATER_AUTO;
-    } else if (strcmp(line, "$CMD,MUTE") == 0) {
-        g_state.muted = true;
-    } else if (strcmp(line, "$CMD,RESET") == 0) {
-        reset_countdown_locked();
-        g_state.pending_evt |= EVT_CLEARED;
+    char *field[4];
+    unsigned count = plant_fields(line, field, 4);
+    uint32_t value;
+    if (count == 2 && !strcmp(field[0], "$EACK") && plant_uint(field[1], &value)) {
+        if (event_active && value == event_id) event_acknowledged = true;
+        return;
     }
+    if (count == 2 && !strcmp(field[0], "$HUM")) {
+        bool valid = plant_uint(field[1], &value) && value <= 100U;
+        if (!valid && strcmp(field[1], "NA")) return;
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        g_state.humidity_valid = valid;
+        if (valid) { g_state.humidity = (uint8_t)value; g_state.humidity_tick = xTaskGetTickCount(); }
+        xSemaphoreGive(stateMutex);
+        return;
+    }
+    if (count != 3 || strcmp(field[0], "$CMD") || !plant_uint(field[1], &value) || value == 0U) return;
+    if (command_seen && value == command_id) { uart_send_str(command_reply); return; }
+    const char *result = "OK";
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    if (!strcmp(field[2], "WATER_ON")) {
+        if (!sensors_fresh(&g_state, xTaskGetTickCount())) result = "DENIED_SENSOR";
+        else if (g_state.state == ST_FULL) result = "DENIED_FULL";
+        else g_state.water_mode = WATER_FORCE_ON;
+    } else if (!strcmp(field[2], "WATER_OFF")) g_state.water_mode = WATER_FORCE_OFF;
+    else if (!strcmp(field[2], "AUTO")) g_state.water_mode = WATER_AUTO;
+    else if (!strcmp(field[2], "MUTE")) g_state.muted = true;
+    else if (!strcmp(field[2], "UNMUTE")) g_state.muted = false;
+    else if (!strcmp(field[2], "RESET")) {
+        if (!sensors_fresh(&g_state, xTaskGetTickCount()) || g_state.level >= LEVEL_EMPTY_ADC) result = "DENIED_NOT_EMPTY";
+        else { reset_countdown_locked(); raise_event(EVENT_RESET); }
+    } else result = "BAD_COMMAND";
     xSemaphoreGive(stateMutex);
-    PRINTF("[rx] %s\r\n", line);
+    command_id = value;
+    command_seen = true;
+    snprintf(command_reply, sizeof(command_reply), "$ACK,%lu,%s\n", (unsigned long)value, result);
+    uart_send_str(command_reply); /* No serial I/O while holding stateMutex. */
 }
-
 static void tComms(void *arg)
 {
     (void)arg;
-    char line[48];
-    uint8_t len = 0;
-    char out[96];
-    TickType_t last_stat = xTaskGetTickCount();
-
+    plant_line_t line = {0};
+    TickType_t last_stat = xTaskGetTickCount() - pdMS_TO_TICKS(STAT_PERIOD_MS);
+    TickType_t last_event = xTaskGetTickCount() - pdMS_TO_TICKS(EVENT_RETRY_MS);
+    uint32_t observed_errors = rx_errors;
+    uart_send_str("$BOOT\n");
     for (;;) {
-        uint8_t c;
-        /* 1. Drain incoming bytes (blocks up to 50 ms so status still goes out on time) */
-        while (xQueueReceive(rxQ, &c, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (c == '\r') continue;
-            if (c == '\n') {
-                line[len] = '\0';
-                if (len > 0 && line[0] == '$') handle_line(line);
-                len = 0;
-            } else if (len < sizeof(line) - 1U) {
-                line[len++] = (char)c;
-            } else {
-                len = 0;   /* overlong line: discard */
+        /* Bound each receive batch; a stream of input cannot starve transmission. */
+        for (unsigned n = 0; n < 64; n++) {
+            uint8_t c;
+            if (rx_errors != observed_errors) {
+                observed_errors = rx_errors;
+                line.discard = true;
+                line.length = 0;
             }
+            if (xQueueReceive(rxQ, &c, 0) != pdTRUE) break;
+            if (plant_line_byte(&line, (char)c)) handle_line(line.text);
         }
-
-        /* 2. Snapshot state, take pending events */
+        TickType_t now = xTaskGetTickCount();
         xSemaphoreTake(stateMutex, portMAX_DELAY);
-        system_state_t snap = g_state;
-        g_state.pending_evt = 0;
-        xSemaphoreGive(stateMutex);
-
-        if (snap.pending_evt & EVT_FULL)    uart_send_str("$EVT,FULL\n");
-        if (snap.pending_evt & EVT_CLEARED) uart_send_str("$EVT,CLEARED\n");
-        if (snap.pending_evt & EVT_EXPIRED) uart_send_str("$EVT,EXPIRED\n");
-
-        /* 3. Periodic status frame */
-        if ((xTaskGetTickCount() - last_stat) >= pdMS_TO_TICKS(STAT_PERIOD_MS)) {
-            last_stat = xTaskGetTickCount();
-            snprintf(out, sizeof(out), "$STAT,%ld,%d,%u,%u,%u,%d,%d\n",
-                     (long)snap.time_left_s, (int)snap.state,
-                     (unsigned)snap.level, (unsigned)snap.light, (unsigned)snap.humidity,
-                     snap.soil_dry ? 1 : 0, snap.watering ? 1 : 0);
-            uart_send_str(out);
+        if (event_active && event_acknowledged) {
+            if (g_state.event_generation[event_index] == event_generation)
+                g_state.pending_evt &= (uint8_t)~(1U << event_index);
+            event_active = false;
+            event_acknowledged = false;
         }
+        if (!event_active && g_state.pending_evt) {
+            for (event_index = 0; event_index < EVENT_COUNT; event_index++)
+                if (g_state.pending_evt & (1U << event_index)) break;
+            event_generation = g_state.event_generation[event_index];
+            event_id++;
+            if (event_id == 0U) event_id++;
+            event_active = true;
+            last_event = now - pdMS_TO_TICKS(EVENT_RETRY_MS);
+        }
+        system_state_t s = g_state;
+        xSemaphoreGive(stateMutex);
+        char out[PLANT_LINE_CAP];
+        if (event_active && (TickType_t)(now - last_event) >= pdMS_TO_TICKS(EVENT_RETRY_MS)) {
+            snprintf(out, sizeof(out), "$EVT,%lu,%s\n", (unsigned long)event_id, event_name[event_index]);
+            uart_send_str(out);
+            last_event = now;
+        }
+        if ((TickType_t)(now - last_stat) >= pdMS_TO_TICKS(STAT_PERIOD_MS)) {
+            bool valid = sensors_fresh(&s, now);
+            bool watering = s.watering && plant_can_water(valid, s.state == ST_FULL);
+            snprintf(out, sizeof(out), "$STAT,%ld,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                     (long)s.time_left_s, (unsigned)s.state, s.level, s.light,
+                     humidity_fresh(&s, now) ? s.humidity : 255U, s.soil_dry ? 1U : 0U,
+                     watering ? 1U : 0U, (unsigned)s.water_mode, valid ? 1U : 0U);
+            uart_send_str(out);
+            last_stat = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
 int main(void)
 {
     BOARD_InitBootPins();
     BOARD_InitBootClocks();
     BOARD_InitDebugConsole();
-
-    /* RTOS objects must exist before the ISRs are enabled in hw_init() */
     stateMutex = xSemaphoreCreateMutex();
-    soilSem    = xSemaphoreCreateBinary();
-    sensorQ    = xQueueCreate(8, sizeof(sensor_sample_t));
-    rxQ        = xQueueCreate(64, sizeof(uint8_t));
-
+    soilSem = xSemaphoreCreateBinary();
+    sensorQ = xQueueCreate(8, sizeof(sensor_sample_t));
+    rxQ = xQueueCreate(128, sizeof(uint8_t));
+    configASSERT(stateMutex && soilSem && sensorQ && rxQ);
     memset(&g_state, 0, sizeof(g_state));
-    g_state.time_left_s = (int32_t)BREED_WINDOW_S;
-    g_state.state       = ST_OK;
-    g_state.water_mode  = WATER_AUTO;
-
+    reset_countdown_locked();
+    g_state.water_mode = WATER_AUTO;
     hw_init();
-    xSemaphoreGive(soilSem);   /* make tIrrigation check the soil once at start-up */
-    PRINTF("Plant care / anti-dengue MCXC444 MVP starting\r\n");
-
-    xTaskCreate(tIrrigation, "tIrrigation", 256, NULL, 3, NULL);
-    xTaskCreate(tCountdown,  "tCountdown",  256, NULL, 2, NULL);
-    xTaskCreate(tSensorPoll, "tSensorPoll", 192, NULL, 2, NULL);
-    xTaskCreate(tActuator,   "tActuator",   192, NULL, 2, NULL);
-    xTaskCreate(tComms,      "tComms",      320, NULL, 1, NULL);
-
+    xSemaphoreGive(soilSem);
+    PRINTF("Plant care: register peripherals + FreeRTOS\r\n");
+    BaseType_t created = xTaskCreate(tIrrigation, "tIrrigation", 320, NULL, 3, NULL);
+    configASSERT(created == pdPASS);
+    created = xTaskCreate(tCountdown, "tCountdown", 320, NULL, 2, NULL);
+    configASSERT(created == pdPASS);
+    created = xTaskCreate(tSensorPoll, "tSensorPoll", 192, NULL, 2, NULL);
+    configASSERT(created == pdPASS);
+    created = xTaskCreate(tActuator, "tActuator", 192, NULL, 2, NULL);
+    configASSERT(created == pdPASS);
+    created = xTaskCreate(tComms, "tComms", 512, NULL, 1, NULL);
+    configASSERT(created == pdPASS);
     vTaskStartScheduler();
+    configASSERT(0);
     for (;;) { }
 }

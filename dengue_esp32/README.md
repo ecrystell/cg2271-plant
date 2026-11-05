@@ -38,19 +38,23 @@ arduino-cli compile --fqbn esp32:esp32:esp32s2 -u -p COM5 dengue_esp32
 arduino-cli monitor -p COM5 -c baudrate=115200
 ```
 
-## 4. Expected serial output
+## 4. Expected behaviour
+
+After Wi-Fi connects and NTP time syncs (needed for the TLS certificate check), the bot posts
+"Plant care online. Use /status, /water, /stop, /auto...". The serial monitor is quiet except for
+received commands:
 
 ```
-Connecting to SSID:<your ssid>
-.....
-Connected to WiFi network with IP Address: ...
-[tg] sent: Plant care system online. Send /status any time.
-[tg] stack free (min): ~12700 bytes
 [tg] command: /status
+[tg] ignored message from chat 123456789 (CHAT_ID mismatch)   <- CHAT_ID is wrong
 ```
 
-Without the DHT11 wired, `Humidity read failed or out of range` prints every 30 s — expected. Without the
-MCXC444, `/status` replies "Time left: unknown".
+Without the MCXC444 connected, `/status` replies "Controller status unavailable or stale" and
+control commands reply "Controller offline; command not queued" — this is by design.
+
+Commands: `/status /report /water /stop /auto /mute /unmute /reset` (`/open` and `/close` are
+aliases for `/water` and `/stop`). The daily report interval is `reportDelay` (24 h; set
+`300000` for a 5-minute demo).
 
 ## Wiring
 
