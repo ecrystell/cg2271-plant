@@ -49,7 +49,7 @@ Connected to WiFi network with IP Address: ...
 [tg] command: /status
 ```
 
-Without a DHT22 wired, `DHT22 read failed` prints every 30 s — expected. Without the
+Without the DHT11 wired, `Humidity read failed or out of range` prints every 30 s — expected. Without the
 MCXC444, `/status` replies "Time left: unknown".
 
 ## Wiring
@@ -58,5 +58,5 @@ MCXC444, `/status` replies "Time left: unknown".
 |---|---|
 | MCXC444 TX (PTE0) | GPIO16 (RX) |
 | MCXC444 RX (PTE1) | GPIO17 (TX) |
-| DHT22 data | GPIO4, 10 kΩ pull-up to 3V3 |
+| DHT11 module VCC / DATA / GND | 3V3 / GPIO4 / GND (3-pin module has its own pull-up) |
 | GND | common with MCXC444 |

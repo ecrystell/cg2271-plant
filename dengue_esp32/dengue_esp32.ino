@@ -4,7 +4,7 @@
 -- Structure adapted from the AS4 sample (c) Low Tjun Lym, NUS — educational use only.
 --------------------------------------------------------------------------------
 -- Role of this board
---   - Reads the DHT22 humidity sensor (polled) and sends it to the MCXC444 over UART
+--   - Reads the DHT11 humidity sensor (polled) and sends it to the MCXC444 over UART
 --   - Receives status / events from the MCXC444 over UART
 --   - Over Wi-Fi + HTTPS, uses the Telegram Bot API (REST) to:
 --       send a daily time-left report
@@ -15,7 +15,7 @@
 --                              Adafruit Unified Sensor
 -- Secrets  : fill in secrets.h (see the notes in that file; never commit real values)
 -- Wiring : MCXC444 TX -> GPIO16 (RX2), MCXC444 RX <- GPIO17 (TX2), common GND
---          DHT22 data -> GPIO4 (10k pull-up to 3V3)
+--          DHT11 module data -> GPIO4 (module has its own pull-up), VCC 3V3
 --
 -- UART protocol (9600 8N1, one message per line):
 --   MCXC444 -> ESP32 : $STAT,<time_left_s>,<state>,<level>,<light>,<humidity>,<soil_dry>,<watering>
@@ -26,7 +26,7 @@
 --                      (LID_* names kept from an earlier design; they now control the sprinkler)
 --
 -- Tasks / RTOS objects
---   tUartBridge : UART receive + DHT22 polling
+--   tUartBridge : UART receive + DHT11 polling
 --   tTelegram   : daily report, event alerts, command polling
 --   statusMutex : guards the status variables
 --   uartMutex   : one writer on Serial1 at a time
@@ -51,6 +51,7 @@ String chatId   = CHAT_ID;
 
 // Pins
 #define DHT_PIN     4
+#define DHT_TYPE    DHT11   // blue 3-pin module; use DHT22 for the white one
 #define MCX_RX_PIN  16
 #define MCX_TX_PIN  17
 #define MCX_BAUD    9600
@@ -65,7 +66,7 @@ long timeLeft = -1;     // simulated seconds left, -1 = no data yet
 int  binState = 0;      // 0 = OK, 1 = full, 2 = expired
 int  waterLevel = 0;
 int  lightLevel = 0;
-int  humidity = -1;     // from DHT22
+int  humidity = -1;     // from DHT11
 
 // Events from the MCXC444
 #define EVT_FULL     1
@@ -76,7 +77,7 @@ SemaphoreHandle_t statusMutex;
 SemaphoreHandle_t uartMutex;
 QueueHandle_t     evtQueue;
 
-DHT dht(DHT_PIN, DHT22);
+DHT dht(DHT_PIN, DHT_TYPE);
 
 /* ------------------------------------------------------------------ */
 /* HTTP helpers (same pattern as the sample, but HTTPS for Telegram)    */
@@ -228,7 +229,7 @@ void checkTelegramCommands(long &offset) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Task: tUartBridge — UART receive + DHT22 polling                     */
+/* Task: tUartBridge — UART receive + DHT11 polling                     */
 /* ------------------------------------------------------------------ */
 void handleMcxLine(String line) {
   Serial.println("[rx] " + line);
@@ -272,13 +273,13 @@ void tUartBridge(void *pvParameters) {
       }
     }
 
-    // 2. Poll the DHT22 and forward humidity to the MCXC444
+    // 2. Poll the DHT11 and forward humidity to the MCXC444
     if (firstRead || (millis() - lastHumidity) > humidityDelay) {
       firstRead = false;
       lastHumidity = millis();
       float h = dht.readHumidity();
-      if (isnan(h)) {
-        Serial.println("DHT22 read failed");
+      if (isnan(h) || h < 0 || h > 100) {
+        Serial.println("Humidity read failed or out of range (check DHT_TYPE / wiring)");
       } else {
         int hi = (int)(h + 0.5);
         xSemaphoreTake(statusMutex, portMAX_DELAY);
