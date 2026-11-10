@@ -11,6 +11,7 @@
 #include <Arduino_JSON.h>
 #include <DHT.h>
 #include <time.h>
+#include <esp_system.h>
 #include "plant_rules.h"
 #include "telegram_ca.h"
 #include "gateway_types.h"
@@ -60,15 +61,25 @@ void sendToMcx(const String &line) {
   Serial1.print('\n');
   xSemaphoreGive(uartMutex);
 }
+/* Set to 1 only to test whether certificate checking is the problem. */
+#define TLS_INSECURE_TEST 0
+
 String httpRequest(const String &url, const String *body) {
-  if (WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000) return "{}";
+  String what = url.substring(url.lastIndexOf('/'));          /* never print the token */
+  int q = what.indexOf('?'); if (q > 0) what = what.substring(0, q);
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("[http] skipped " + what + ": Wi-Fi down"); return "{}"; }
+  if (time(nullptr) < 1700000000)    { Serial.println("[http] skipped " + what + ": clock not synced"); return "{}"; }
   WiFiClientSecure client;
+#if TLS_INSECURE_TEST
+  client.setInsecure();
+#else
   client.setCACert(TELEGRAM_ROOT_CA);
+#endif
   client.setHandshakeTimeout(8);
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(7000);
-  if (!http.begin(client, url)) return "{}";
+  if (!http.begin(client, url)) { Serial.println("[http] begin failed " + what); return "{}"; }
   int code;
   if (body) {
     http.addHeader("Content-Type", "application/json");
@@ -78,6 +89,15 @@ String httpRequest(const String &url, const String *body) {
   if (code == 200 && http.getSize() <= 32768) {
     String received = http.getString();
     if (received.length() <= 32768) response = received;
+    if (body) Serial.println("[http] " + what + " OK");
+  } else if (code > 0) {
+    /* 401 = bad token, 400 = bad chat id / never messaged the bot, 409 = webhook set */
+    Serial.printf("[http] %s HTTP %d: %s\n", what.c_str(), code, http.getString().substring(0, 160).c_str());
+  } else {
+    char err[120] = "";
+    client.lastError(err, sizeof(err));
+    Serial.printf("[http] %s failed (%d %s) TLS: %s  free heap %u\n", what.c_str(), code,
+                  http.errorToString(code).c_str(), err, (unsigned)ESP.getFreeHeap());
   }
   http.end();
   return response;
@@ -282,6 +302,13 @@ void tTelegram(void *argument) {
   uint32_t lastWifiAttempt = millis();
   for (;;) {
     uint32_t now = millis();
+    static int lastWifi = -1;
+    if ((int)WiFi.status() != lastWifi) {
+      lastWifi = (int)WiFi.status();
+      /* 1 SSID not found, 3 connected, 4 connect failed (password), 6 disconnected */
+      Serial.printf("Wi-Fi status: %d%s\n", lastWifi,
+                    lastWifi == WL_CONNECTED ? (" IP " + WiFi.localIP().toString()).c_str() : "");
+    }
     if (WiFi.status() != WL_CONNECTED) {
       if (ssid[0] && now - lastWifiAttempt >= 30000UL) {
         WiFi.disconnect(); WiFi.begin(ssid, password); lastWifiAttempt = now;
@@ -289,7 +316,17 @@ void tTelegram(void *argument) {
       vTaskDelay(pdMS_TO_TICKS(250));
       continue; /* UART/DHT task keeps running without Wi-Fi. */
     }
-    if (time(nullptr) < 1700000000) { vTaskDelay(pdMS_TO_TICKS(250)); continue; }
+    static bool clockReported = false;
+    static uint32_t lastClockMsg = 0;
+    if (time(nullptr) < 1700000000) {
+      if (now - lastClockMsg >= 5000UL) { lastClockMsg = now; Serial.println("Waiting for internet time (NTP)..."); }
+      vTaskDelay(pdMS_TO_TICKS(250)); continue;
+    }
+    if (!clockReported) {
+      clockReported = true;
+      time_t t = time(nullptr);
+      Serial.printf("Clock synced: %s", ctime(&t));
+    }
     if (!onlineSent) onlineSent = sendTelegram("Plant care online. Use /status, /water, /stop, /auto. Watering is locally controlled.");
     PlantEvent event;
     if (xQueuePeek(evtQueue, &event, 0) == pdTRUE) {
@@ -321,7 +358,14 @@ void tTelegram(void *argument) {
   }
 }
 void setup() {
+<<<<<<< Updated upstream
   Serial.begin(115200);
+=======
+  Serial.begin(9600);   // match the Serial Monitor setting
+  delay(1500);  /* give the Serial Monitor time to attach */
+  Serial.printf("\n=== Plant gateway boot, reset reason %d (1 power-on, 4 crash, 5-7 watchdog, 9 brownout) ===\n",
+                (int)esp_reset_reason());
+>>>>>>> Stashed changes
   chatId.replace(" ", ""); /* Tolerate stray spaces pasted into CHAT_ID. */
   botToken.trim();
   Serial1.setRxBufferSize(512);
@@ -336,12 +380,24 @@ void setup() {
   nextCommandId = esp_random();
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  Serial.printf("Token set: %s, chat id: %s\n", botToken.length() ? "yes" : "NO", chatId.c_str());
+  int found = WiFi.scanNetworks();
+  bool seen = false;
+  for (int i = 0; i < found; i++) if (WiFi.SSID(i) == ssid) seen = true;
+  Serial.printf("Scan: %d networks, \"%s\" %s\n", found, ssid, seen ? "FOUND" : "NOT FOUND (2.4 GHz only)");
+  WiFi.scanDelete();
   if (ssid[0]) WiFi.begin(ssid, password);
   configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
   /* Core 1 only exists on dual-core chips; the ESP32-S2 is single-core. */
   const BaseType_t uartCore = (portNUM_PROCESSORS > 1) ? 1 : 0;
+<<<<<<< Updated upstream
   BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096, nullptr, 3, nullptr, uartCore);
   BaseType_t telegramCreated = xTaskCreatePinnedToCore(tTelegram, "tTelegram", 12288, nullptr, 2, nullptr, 0);
+=======
+  BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 6144, nullptr, 3, nullptr, uartCore);
+  BaseType_t telegramCreated = xTaskCreatePinnedToCore(tTelegram, "tTelegram", 20480, nullptr, 2, nullptr, 0);  /* TLS needs a large stack */
+>>>>>>> Stashed changes
   configASSERT(bridgeCreated == pdPASS && telegramCreated == pdPASS);
+  Serial.println("Tasks started.");
 }
 void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
