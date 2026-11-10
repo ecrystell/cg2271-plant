@@ -14,18 +14,21 @@
 #include "plant_rules.h"
 #include "telegram_ca.h"
 #include "gateway_types.h"
+#include "secrets.h" /* WIFI_SSID, WIFI_PASSWORD, BOT_TOKEN, CHAT_ID; never commit real values. */
 
-const char* ssid = "";
-const char* password = "";
-String botToken = "";
-String chatId = "";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+String botToken = BOT_TOKEN;
+String chatId = CHAT_ID;
 #define DHT_PIN 4
+#define DHT_TYPE DHT11 /* Blue 3-pin module; use DHT22 for the white one. */
 #define MCX_RX_PIN 16
 #define MCX_TX_PIN 17
 #define MCX_BAUD 9600
 #define STATUS_TTL_MS 15000UL
 #define COMMAND_TTL_MS 10000UL
 #define COMMAND_RETRY_MS 2000UL
+#define SEND_RETRY_MS 30000UL /* Back-off after a failed sendMessage (blocked bot, rate limit, outage). */
 unsigned long humidityDelay = 30000UL;
 unsigned long reportDelay = 86400000UL; /* Daily interval; use 300000 only for a demo. */
 unsigned long telegramDelay = 3000UL;
@@ -35,7 +38,7 @@ PendingCommand pending = {};
 SemaphoreHandle_t statusMutex, uartMutex;
 QueueHandle_t evtQueue, cmdQueue, noticeQueue;
 uint32_t controllerGeneration = 1, queuedEvent = 0, deliveredEvent = 0, nextCommandId;
-DHT dht(DHT_PIN, DHT22);
+DHT dht(DHT_PIN, DHT_TYPE);
 
 PlantStatus statusCopy() {
   xSemaphoreTake(statusMutex, portMAX_DELAY);
@@ -79,14 +82,21 @@ String httpRequest(const String &url, const String *body) {
   http.end();
   return response;
 }
-bool sendTelegram(const String &text) {
+bool sendTelegram(const String &text) { /* Only called from tTelegram. */
+  static bool failed = false;
+  static uint32_t failedAt = 0;
   if (botToken.length() == 0 || chatId.length() == 0) return false;
+  /* After a failure, skip sends for SEND_RETRY_MS; callers keep the message pending. */
+  if (failed && millis() - failedAt < SEND_RETRY_MS) return false;
   JSONVar message;
   message["chat_id"] = chatId;
   message["text"] = text;
   String body = JSON.stringify(message);
   JSONVar response = JSON.parse(httpRequest("https://api.telegram.org/bot" + botToken + "/sendMessage", &body));
-  return JSON.typeof(response["ok"]) == "boolean" && (bool)response["ok"];
+  bool ok = JSON.typeof(response["ok"]) == "boolean" && (bool)response["ok"];
+  failed = !ok;
+  if (!ok) failedAt = millis();
+  return ok;
 }
 String formatTimeLeft(uint32_t seconds) {
   return String(seconds / 86400UL) + " d " + String((seconds % 86400UL) / 3600UL) + " h";
@@ -148,8 +158,14 @@ void checkTelegramCommands(long &offset, bool &initialSync) {
     String fromChat = String((long long)(double)updates[i]["message"]["chat"]["id"]);
     time_t sent = (time_t)(double)updates[i]["message"]["date"];
     time_t now = time(nullptr);
-    if (fromChat == chatId && sent <= now && now - sent < 120)
+    if (fromChat != chatId) {
+      Serial.println("[tg] ignored message from chat " + fromChat + " (CHAT_ID mismatch)");
+      continue;
+    }
+    if (sent <= now && now - sent < 120) {
+      Serial.println(String("[tg] command: ") + (const char *)updates[i]["message"]["text"]);
       handleCommand((const char *)updates[i]["message"]["text"]);
+    }
   }
   initialSync = false;
 }
@@ -306,6 +322,8 @@ void tTelegram(void *argument) {
 }
 void setup() {
   Serial.begin(115200);
+  chatId.replace(" ", ""); /* Tolerate stray spaces pasted into CHAT_ID. */
+  botToken.trim();
   Serial1.setRxBufferSize(512);
   Serial1.begin(MCX_BAUD, SERIAL_8N1, MCX_RX_PIN, MCX_TX_PIN);
   dht.begin();
@@ -320,7 +338,9 @@ void setup() {
   WiFi.setAutoReconnect(true);
   if (ssid[0]) WiFi.begin(ssid, password);
   configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
-  BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096, nullptr, 3, nullptr, 1);
+  /* Core 1 only exists on dual-core chips; the ESP32-S2 is single-core. */
+  const BaseType_t uartCore = (portNUM_PROCESSORS > 1) ? 1 : 0;
+  BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096, nullptr, 3, nullptr, uartCore);
   BaseType_t telegramCreated = xTaskCreatePinnedToCore(tTelegram, "tTelegram", 12288, nullptr, 2, nullptr, 0);
   configASSERT(bridgeCreated == pdPASS && telegramCreated == pdPASS);
 }
