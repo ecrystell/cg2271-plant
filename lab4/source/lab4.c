@@ -42,8 +42,12 @@
 #define WATER_COOLDOWN_MS    20000U
 #define MANUAL_WATER_MAX_MS  10000U
 #define SOIL_DRY_LEVEL       1U
-#define VALVE_OPEN_PCT       10U
-#define VALVE_CLOSED_PCT     5U
+/* Relay IN -> PTB0; relay supply -> module-rated supply; GND -> MCU GND.
+ * COM/NO switch the external motor supply for one-direction rotation.
+ * 1: relay energizes on HIGH; 0: relay energizes on LOW.
+ * Verify the module accepts 3.3 V logic before connecting it.
+ * Timed operation only: there is no disc-position feedback in this firmware. */
+#define RELAY_ACTIVE_LEVEL   0U /* Active-low module: LOW on, HIGH off. */
 #define STAT_PERIOD_MS       5000U
 #define EVENT_RETRY_MS       3000U
 #define PERIPH_CLK_HZ        48000000U
@@ -53,7 +57,7 @@
 #define SOIL_GPIO            GPIOA
 #define LIGHT_ADC_CH         3U  /* PTE22, on-board light */
 #define WATER_ADC_CH         0U  /* PTE20, water sensor */
-#define SERVO_TPM            TPM1 /* PTB0, ALT3, channel 0 */
+#define RELAY_PIN            0U /* PTB0, GPIO: relay IN, not motor power */
 #define BUZZ_TPM             TPM2 /* PTB2, ALT3, channel 0 */
 #define ESP_UART             LPUART1 /* PTE0 TX / PTE1 RX, ALT3 */
 #define UART_ERRORS (LPUART_STAT_OR_MASK | LPUART_STAT_NF_MASK | \
@@ -161,6 +165,12 @@ static void watering_led(bool on)
     GPIOD->PSOR = 1UL << 5;
     if (on) GPIOE->PCOR = 1UL << 29; /* Blue, active low. */
 }
+static void motor_set(bool on)
+{
+    bool high = on ? RELAY_ACTIVE_LEVEL != 0U : RELAY_ACTIVE_LEVEL == 0U;
+    if (high) GPIOB->PSOR = 1UL << RELAY_PIN;
+    else GPIOB->PCOR = 1UL << RELAY_PIN;
+}
 static void pwm_duty(TPM_Type *tpm, uint32_t percent)
 {
     tpm->CONTROLS[0].CnV = ((tpm->MOD + 1U) * percent) / 100U;
@@ -185,10 +195,14 @@ static bool uart_send_str(const char *text)
         }
         ESP_UART->DATA = (uint8_t)*text++;
     }
-    /* Echo complete outgoing messages to the board's debug-console terminal.
-     * Messages already contain '\n'; add CRLF here without a second blank line. */
+    /* The SDK's basic PRINTF does not support dynamic string precision (%.*s).
+     * Strip the line ending into a bounded copy and use its supported %s. */
+    char console_line[PLANT_LINE_CAP];
     size_t length = strcspn(message, "\r\n");
-    PRINTF("sent to esp32: %.*s\r\n", (int)length, message);
+    if (length >= sizeof(console_line)) length = sizeof(console_line) - 1U;
+    memcpy(console_line, message, length);
+    console_line[length] = '\0';
+    PRINTF("sent to esp32: %s\r\n", console_line);
     return true;
 }
 static void hw_init(void)
@@ -197,9 +211,12 @@ static void hw_init(void)
     NVIC_DisableIRQ(LPUART1_IRQn);
     SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK |
                   SIM_SCGC5_PORTD_MASK | SIM_SCGC5_PORTE_MASK | SIM_SCGC5_LPUART1_MASK;
-    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK | SIM_SCGC6_TPM1_MASK | SIM_SCGC6_TPM2_MASK;
+    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK | SIM_SCGC6_TPM2_MASK;
 
     /* LL-2: select GPIO, establish the OFF value, then set output direction. */
+    motor_set(false);
+    PORTB->PCR[RELAY_PIN] = PORT_PCR_MUX(1U);
+    GPIOB->PDDR |= 1UL << RELAY_PIN;
     PORTE->PCR[31] = PORT_PCR_MUX(1U);
     PORTE->PCR[29] = PORT_PCR_MUX(1U);
     PORTD->PCR[5] = PORT_PCR_MUX(1U);
@@ -230,12 +247,10 @@ static void hw_init(void)
     }
     ADC0->SC3 = 0U;
 
-    /* LL-4/5: independent TPM periods, 50 Hz servo and 2 kHz passive buzzer. */
+    /* LL-4/5: TPM2 produces the 2 kHz passive-buzzer signal. */
     SIM->SOPT2 = (SIM->SOPT2 & ~(SIM_SOPT2_TPMSRC_MASK | SIM_SOPT2_LPUART1SRC_MASK)) |
                  SIM_SOPT2_TPMSRC(1U) | SIM_SOPT2_LPUART1SRC(1U);
-    PORTB->PCR[0] = PORT_PCR_MUX(3U);
     PORTB->PCR[2] = PORT_PCR_MUX(3U);
-    pwm_init(SERVO_TPM, 50U, VALVE_CLOSED_PCT);
     pwm_init(BUZZ_TPM, 2000U, 0U);
 
     /* LL-8 register sequence, using LPUART1 instead of changing the wired UART. */
@@ -346,14 +361,13 @@ static void tIrrigation(void *arg)
 static void tActuator(void *arg)
 {
     (void)arg;
-    uint8_t beep = 0, previous_duty = 255;
+    uint8_t beep = 0;
     for (;;) {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         system_state_t s = g_state;
         xSemaphoreGive(stateMutex);
         bool on = s.watering && plant_can_water(sensors_fresh(&s, xTaskGetTickCount()), s.state == ST_FULL);
-        uint8_t duty = on ? VALVE_OPEN_PCT : VALVE_CLOSED_PCT;
-        if (duty != previous_duty) { pwm_duty(SERVO_TPM, duty); previous_duty = duty; }
+        motor_set(on);
         watering_led(on);
         beep = (uint8_t)((beep + 1U) % 6U);
         bool alarm = (s.state == ST_FULL || s.state == ST_EXPIRED) && !s.muted;

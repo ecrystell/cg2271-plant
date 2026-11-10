@@ -11,9 +11,9 @@
 #define SERVO_CLOCK_HZ 48000000UL
 #define SERVO_PRESCALER 16UL
 #define SERVO_PERIOD_HZ 50UL
-#define POSITION_A_US 500UL
-#define POSITION_B_US 2500UL
-#define HOLD_MS 2000UL
+#define POSITION_A_US 600UL
+#define POSITION_B_US 2600UL
+#define HOLD_MS 2000U
 
 static void servo_position(uint32_t pulse_us)
 {
