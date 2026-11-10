@@ -358,14 +358,10 @@ void tTelegram(void *argument) {
   }
 }
 void setup() {
-<<<<<<< Updated upstream
-  Serial.begin(115200);
-=======
   Serial.begin(9600);   // match the Serial Monitor setting
   delay(1500);  /* give the Serial Monitor time to attach */
   Serial.printf("\n=== Plant gateway boot, reset reason %d (1 power-on, 4 crash, 5-7 watchdog, 9 brownout) ===\n",
                 (int)esp_reset_reason());
->>>>>>> Stashed changes
   chatId.replace(" ", ""); /* Tolerate stray spaces pasted into CHAT_ID. */
   botToken.trim();
   Serial1.setRxBufferSize(512);
@@ -390,13 +386,8 @@ void setup() {
   configTime(8 * 3600, 0, "pool.ntp.org", "time.google.com");
   /* Core 1 only exists on dual-core chips; the ESP32-S2 is single-core. */
   const BaseType_t uartCore = (portNUM_PROCESSORS > 1) ? 1 : 0;
-<<<<<<< Updated upstream
-  BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 4096, nullptr, 3, nullptr, uartCore);
-  BaseType_t telegramCreated = xTaskCreatePinnedToCore(tTelegram, "tTelegram", 12288, nullptr, 2, nullptr, 0);
-=======
   BaseType_t bridgeCreated = xTaskCreatePinnedToCore(tUartBridge, "tUartBridge", 6144, nullptr, 3, nullptr, uartCore);
   BaseType_t telegramCreated = xTaskCreatePinnedToCore(tTelegram, "tTelegram", 20480, nullptr, 2, nullptr, 0);  /* TLS needs a large stack */
->>>>>>> Stashed changes
   configASSERT(bridgeCreated == pdPASS && telegramCreated == pdPASS);
   Serial.println("Tasks started.");
 }
