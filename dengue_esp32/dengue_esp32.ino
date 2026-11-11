@@ -253,12 +253,20 @@ void tUartBridge(void *argument) {
   for (;;) {
     for (unsigned n = 0; n < 128 && Serial1.available(); n++)
       if (plant_line_byte(&line, (char)Serial1.read())) handleMcxLine(line.text);
+          /* TEST ONLY: accept MCXC444 messages typed into the Serial Monitor */
+    static plant_line_t usbLine = {};
+    while (Serial.available())
+      if (plant_line_byte(&usbLine, (char)Serial.read())) {
+        Serial.printf("[test] injected %s\n", usbLine.text);
+        handleMcxLine(usbLine.text);
+      }
+      
     uint32_t now = millis();
     if (now - lastHumidity >= humidityDelay) {
       lastHumidity = now;
       float h = dht.readHumidity();
       if (isnan(h) || h < 0 || h > 100) sendToMcx("$HUM,NA");
-      else sendToMcx("$HUM," + String((unsigned)(h + 0.5f)));
+      else { Serial.printf("[dht] humidity %.0f%%\n", h); sendToMcx("$HUM," + String((unsigned)(h + 0.5f))); }
     }
     if (!pending.active) {
       PlantCommand command;
